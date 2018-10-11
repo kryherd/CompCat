@@ -1,0 +1,365 @@
+---
+title: "CompCat Data Analysis Script"
+output:
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+```
+
+Load libraries
+```{r}
+library(reshape2)
+library(reshape)
+library(stringr)
+library(plyr)
+library(ggplot2)
+library(nlme)
+library(pastecs)
+library(car)
+library(psych)
+library(fBasics)
+library(Rmisc)
+setwd("~/CompCat")
+```
+
+# Data Cleaning
+
+We have a few different data sources here.
+
+1. `behavior.csv` contains the behavioral data (assessments, ages, etc.) for all of the participants.
+2. `exp_data.csv` contains the experimental data from the main category learning task (collected in E-Prime 2.0).
+3. `visualnorm.csv` contains aggregated similarity ratings for all of the stimulus pairings.
+
+In this first step, we will select the relevant columns from `exp_data` and add in 3 types of visual similarity for each trial (probe-target, probe-distractor, and target-distractor), as well as a double-click indicator column for use in RT analyses.
+
+```{r}
+#Read in data
+dat0 <- read.csv("exp_data.csv")
+visualnorm <- read.csv("visualnorm.csv")
+#rename column 1 in visual norming
+colnames(visualnorm)[1] <- "Robot"
+#select just data from testing
+dat1 <- subset(dat0, Block==2)
+dat1$condition <- str_match(dat1$ExperimentName, "^([A-Za-z]{1,}_[A-Za-z]{1,})")[, 2]
+dat1$train.type <- as.factor(str_match(dat1$ExperimentName, "^([A-Za-z]{1,})_")[, 2])
+dat1$train.type <- revalue(dat1$train.type, c("Explicit" = "Directed", "Implicit" = "Undirected"))
+dat1$info.type <- as.factor(str_match(dat1$ExperimentName, "^[A-Za-z]{1,}_([A-Za-z]{1,})_")[, 2])
+#pick out the important variables --
+#we can use Stimulus.Acc for test because there is only one response
+# i.e. don't have to use NError
+dat2 <- data.frame(dat1$Subject, dat1$condition, dat1$Trial, dat1$Probe_pic, 
+                      dat1$target_pic, dat1$distractor_pic, dat1$Stimulus.ACC, 
+                      dat1$Stimulus.RESP, dat1$Stimulus.RT, dat1$info.type, dat1$train.type)
+dat2$doubleclick <- NA
+#rename columns
+names(dat2) <- c("Subj","condition", "Trial", "probepic","target_pic",
+                    "distractor_pic","Acc","Resp","RT","info.type", "train.type", "doubleclick")
+#if they double clicked, this column has a 1. If not, a 0
+#double clicks should be removed when analyzing RT
+dat2[dat2$Resp > 2, "doubleclick"] <- 1
+dat2[dat2$Resp == 1, "doubleclick"] <- 0
+
+#put visual norming data into a better format
+vissim <- melt.data.frame(visualnorm, id.vars="Robot")
+names(vissim) <- c("Rob1","Rob2","sim")
+
+#add columns for visual similarity
+#probe-target
+dat1$vs.pt <- NA
+#probe-distractor
+dat1$vs.pd <- NA
+#target-distractor
+dat1$vs.td <- NA
+
+#fill in probe-target visual similarity
+#merge e-prime data with visual norming data
+vs.pt <- merge(dat2, vissim, by.x=c("probepic", "target_pic"), by.y=c("Rob1", "Rob2"), all=T)
+#remove excess columns
+vs.pt <- vs.pt[!is.na(vs.pt$Subj),]
+#sort by subject and trial
+vs.pt.sort<- vs.pt[order(vs.pt$Subj, vs.pt$Trial),] 
+#put the visual similarity column in the overall data frame
+dat2$vs.pt <- vs.pt.sort$sim
+
+#fill in probe-distractor visual similarity
+vs.pd <- merge(dat2, vissim, by.x=c("probepic", "distractor_pic"), by.y=c("Rob1", "Rob2"), all=T)
+vs.pd <- vs.pd[!is.na(vs.pd$Subj),]
+vs.pd.sort<- vs.pd[order(vs.pd$Subj, vs.pd$Trial),] 
+dat2$vs.pd <- vs.pd.sort$sim
+
+#fill in target-distractor visual similarity
+vs.td <- merge(dat2, vissim, by.x=c("target_pic", "distractor_pic"), by.y=c("Rob1", "Rob2"), all=T)
+vs.td <- vs.td[!is.na(vs.td$Subj),]
+vs.td.sort<- vs.td[order(vs.td$Subj, vs.td$Trial),] 
+dat2$vs.td <- vs.td.sort$sim
+```
+
+Now we will calculate the average accuracy for each subject for each condition.
+
+```{r}
+acc <- data.frame(tapply(dat2$Acc, list(dat2$Subj, dat2$condition), mean))
+acc$Subj <- as.numeric(rownames(acc))
+acc.melt <- melt.data.frame(acc, id.vars = "Subj")
+names(acc.melt) <- c("Subj", "Cond", "Acc")
+acc.melt$train.type <- as.factor(str_match(acc.melt$Cond, "^([A-Za-z]{1,})_")[, 2])
+acc.melt$train.type <- revalue(acc.melt$train.type, c("Explicit" = "Directed", "Implicit" = "Undirected"))
+acc.melt$info.type <- as.factor(str_match(acc.melt$Cond, "^[A-Za-z]{1,}_([A-Za-z]{1,})")[, 2])
+```
+
+Now we will merge all of the behavioral data into both the raw data and the aggregated data.
+
+```{r}
+behavior <- read.csv("behavior.csv")
+behavior$Group <- factor(behavior$Group, levels(behavior$Group)[c(2,1)])
+dat3 <- merge(dat2, behavior, by = "Subj")
+acc_beh <- merge(acc.melt, behavior, by = "Subj")
+```
+
+# Group Analysis
+
+For the group analysis, we want to only use people with a WA of greater than 95 and a KTEA of less than 90 or greater than 100.
+
+```{r}
+acc_group <- acc_beh[acc_beh$KTEA_SS <= 90 | acc_beh$KTEA_SS >= 100,]
+min(acc_group$WA_SS)
+min(acc_group$P_IQ)
+
+# check number of subjects
+length(table(acc_group$Subj))
+subs_groups <- data.frame(acc_group$Subj, acc_group$Group)
+subs_groups <- unique(subs_groups)
+table(subs_groups$acc_group.Group)
+```
+
+## Descriptive Statistics
+
+```{r}
+beh_group <- behavior[behavior$KTEA_SS <= 90 | behavior$KTEA_SS >= 100,]
+by(beh_group$KTEA_SS, list(beh_group$Group), mean)
+by(beh_group$KTEA_SS, list(beh_group$Group), sd)
+t.test(beh_group$KTEA_SS ~ beh_group$Group)
+by(beh_group$WA_SS, list(beh_group$Group), mean)
+by(beh_group$WA_SS, list(beh_group$Group), sd)
+t.test(beh_group$WA_SS ~ beh_group$Group)
+by(beh_group$P_IQ, list(beh_group$Group), mean)
+by(beh_group$P_IQ, list(beh_group$Group), sd)
+t.test(beh_group$P_IQ ~ beh_group$Group)
+
+by(acc_group$Acc, list(acc_group$info.type, acc_group$train.type), stat.desc)
+by(acc_group$Acc, list(acc_group$info.type, acc_group$train.type, acc_group$Group), stat.desc)
+```
+
+## *t*-tests
+
+To look for evidence of learning (acc > 0.5), we will use some *t*-tests.
+
+```{r}
+ENV <- subset(acc_group, Cond == "Explicit_Nonverbal")
+ENV.TD <- subset(ENV, Group == "TD")
+ENV.SRCD <- subset(ENV, Group == "PC")
+t.test(ENV.TD$Acc, mu = 0.5)
+t.test(ENV.SRCD$Acc, mu = 0.5)
+
+INV <- subset(acc_group, Cond == "Implicit_Nonverbal")
+INV.TD <- subset(INV, Group == "TD")
+INV.SRCD <- subset(INV, Group == "PC")
+t.test(INV.TD$Acc, mu = 0.5)
+t.test(INV.SRCD$Acc, mu = 0.5)
+
+EV <- subset(acc_group, Cond == "Explicit_Verbal")
+EV.TD <- subset(EV, Group == "TD")
+EV.SRCD <- subset(EV, Group == "PC")
+t.test(EV.TD$Acc, mu = 0.5)
+t.test(EV.SRCD$Acc, mu = 0.5)
+
+IV <- subset(acc_group, Cond == "Implicit_Verbal")
+IV.TD <- subset(IV, Group == "TD")
+IV.SRCD <- subset(IV, Group == "PC")
+t.test(IV.TD$Acc, mu = 0.5)
+t.test(IV.SRCD$Acc, mu = 0.5)
+```
+
+## Linear Mixed-Effects Models
+
+### Standard Analysis
+
+Group x Information Type x Training Type
+
+```{r}
+acc_group$acc.logit <- car::logit(acc_group$Acc)
+
+# add task effects
+m0 <- lme(acc.logit ~ 1, random = ~1|Subj, data = acc_group, method = "ML")
+summary(m0)
+m0.0 <- lme(acc.logit ~ train.type + info.type, random = ~1|Subj, data = acc_group, method = "ML")
+anova(m0,m0.0)
+
+# add task effects and group over and above PIQ and decoding
+m0.5 <- lme(acc.logit ~ P_IQ + WA_SS, random = ~1|Subj, data = acc_group, method = "ML")
+m1 <- lme(acc.logit ~ P_IQ + WA_SS + Group * train.type * info.type, random = ~1|Subj, data = acc_group, method = "ML")
+summary(m1)
+anova(m0.5,m1)
+
+## unpacking interaction between group and training type
+PCSubset <- acc_group$Group=="PC"
+TDSubset <- acc_group$Group=="TD"
+tdModel <- lme(acc.logit ~ P_IQ + WA_SS + train.type * info.type, random = ~1|Subj, data = acc_group, subset = PCSubset, method = "ML")
+summary(tdModel)
+pcModel <- lme(acc.logit ~ P_IQ + WA_SS + train.type * info.type, random = ~1|Subj, data = acc_group, subset = TDSubset, method = "ML")
+summary(pcModel)
+```
+
+### Order Analysis
+
+Group x Information Type x Training Type x Order
+
+```{r}
+# add order
+m2 <- lme(acc.logit ~ P_IQ + WA_SS + Order * Group * train.type * info.type, random = ~1|Subj, data = acc_group, method = "ML")
+summary(m2)
+anova(m1,m2)
+
+## unpacking interaction between group, training type, and order
+dirfSubset <- acc_group$Order=="Directed First"
+undirfSubset <- acc_group$Order=="Undirected First"
+dirfModel <- lme(acc.logit ~ P_IQ + WA_SS + Group * train.type * info.type, random = ~1|Subj, data = acc_group, subset = dirfSubset, method = "ML")
+summary(dirfModel)
+undirfModel <- lme(acc.logit ~ P_IQ + WA_SS + Group * train.type * info.type, random = ~1|Subj, data = acc_group, subset = undirfSubset, method = "ML")
+summary(undirfModel)
+
+## unpacking interaction between group and training type in undirected-first condition
+p.implicitfSubset <- acc_group$Order=="Undirected First" & acc_group$Group =="PC"
+t.implicitfSubset <- acc_group$Order=="Undirected First" & acc_group$Group =="TD"
+p.undirfModel <- lme(acc.logit ~ P_IQ + WA_SS + train.type * info.type, random = ~1|Subj, data = acc_group, subset = p.implicitfSubset, method = "ML")
+summary(p.undirfModel)
+t.undirfModel <- lme(acc.logit ~ P_IQ + WA_SS + train.type * info.type, random = ~1|Subj, data = acc_group, subset = t.implicitfSubset, method = "ML")
+summary(t.undirfModel)
+```
+
+## Plots
+
+```{r}
+acc_summary1 <- summarySE(data = acc_group, "Acc", groupvars = c("train.type", "Group", "info.type"))
+p1 <- ggplot(acc_group, aes(info.type, Acc, fill = Group)) + geom_violin() +
+  xlab("Training Type") + ylab("Accuracy")  + 
+  facet_grid(.~train.type) + 
+  geom_point(aes(y = Acc), size = 2, position = position_dodge((width = 0.90)), data = acc_summary1) + 
+  geom_errorbar(aes(ymin = Acc-se, ymax = Acc+se), 
+                width = 0.20, position = position_dodge((width = 0.90)), data = acc_summary1) + theme_bw()
+p1
+
+acc_summary2 <- summarySE(data = acc_group, "Acc", groupvars = c("train.type", "Group", "Order"))
+p2 <- ggplot(acc_group, aes(train.type, Acc, fill = Group)) + geom_violin() +
+  xlab("Training Type") + ylab("Accuracy")  + 
+  facet_grid(.~Order) + 
+  geom_point(aes(y = Acc), size = 2, position = position_dodge((width = 0.90)), data = acc_summary2) + 
+  geom_errorbar(aes(ymin = Acc-se, ymax = Acc+se), 
+                width = 0.20, position = position_dodge((width = 0.90)), data = acc_summary2) + theme_bw()
+p2
+```
+
+
+# Continuous Analysis
+
+## Linear Mixed-Effects Models
+
+### Standard Analysis
+```{r}
+acc_beh$acc.logit <- car::logit(acc_beh$Acc)
+
+# base model
+m0 <- lme(acc.logit ~ 1, random = ~1|Subj, data = acc_beh, method = "ML")
+summary(m0)
+# adding in task conditions
+m0.0 <- lme(acc.logit ~ train.type + info.type, random = ~1|Subj, data = acc_beh, method = "ML")
+anova(m0,m0.0)
+# adding in individual difference measures
+m0.5 <- lme(acc.logit ~ P_IQ + WA_SS, random = ~1|Subj, data = acc_beh, method = "ML")
+# full model
+m1 <- lme(acc.logit ~ P_IQ + WA_SS + KTEA_SS * train.type * info.type, random = ~1|Subj, data = acc_beh, method = "ML")
+summary(m1)
+anova(m0.5,m1)
+```
+
+### Order Analysis
+
+```{r}
+m2 <- lme(acc.logit ~ P_IQ + WA_SS + KTEA_SS * Order * train.type * info.type, random = ~1|Subj, data = acc_beh, method = "ML")
+summary(m2)
+anova(m1,m2)
+
+dirfSubset <- acc_beh$Order=="Directed First"
+undirfSubset <- acc_beh$Order=="Undirected First"
+dirfModel <- lme(acc.logit ~ P_IQ + WA_SS + KTEA_SS * train.type * info.type, random = ~1|Subj, data = acc_beh, subset = dirfSubset, method = "ML")
+summary(dirfModel)
+undirfModel <- lme(acc.logit ~ P_IQ + WA_SS + KTEA_SS * train.type * info.type, random = ~1|Subj, data = acc_beh, subset = undirfSubset, method = "ML")
+summary(undirfModel)
+```
+
+## Plots
+
+```{r}
+p2 <- ggplot(acc_beh, aes(KTEA_SS, Acc, color = train.type)) + geom_point() +
+  xlab("Reading Comprehension") + ylab("Accuracy")  + 
+  facet_grid(.~Order) + theme_bw() + geom_smooth(method = "lm", se = FALSE)
+p2
+```
+
+# Misc Analyses
+
+## Reliability
+```{r}
+reliability <- dat3[,c(1,2,3,7)]
+rel <- cast(reliability, Subj ~ condition, sum, value = "Acc")
+alpha(rel[,-1])
+rel_ENV <- cast(subset(reliability, condition == "Explicit_Nonverbal"), Subj ~ condition + Trial, sum, value = "Acc")
+rel_EV <- cast(subset(reliability, condition == "Explicit_Verbal"), Subj ~ condition + Trial, sum, value = "Acc")
+rel_INV <- cast(subset(reliability, condition == "Implicit_Nonverbal"), Subj ~ condition + Trial, sum, value = "Acc")
+rel_IV <- cast(subset(reliability, condition == "Implicit_Verbal"), Subj ~ condition + Trial, sum, value = "Acc")
+alpha(rel_ENV[,-1])
+alpha(rel_EV[,-1])
+alpha(rel_IV[,-1])
+alpha(rel_INV[,-1])
+```
+
+## Ceiling Effects 
+```{r}
+ENV <- subset(acc_group, Cond == "Explicit_Nonverbal")
+EV <- subset(acc_group, Cond == "Explicit_Verbal")
+INV <- subset(acc_group, Cond == "Implicit_Nonverbal")
+IV <- subset(acc_group, Cond == "Implicit_Verbal")
+
+dagoTest(ENV$Acc)
+dagoTest(EV$Acc)
+dagoTest(INV$Acc)
+dagoTest(IV$Acc)
+
+EV_high <- subset(EV, Acc > 0.95)
+table(EV_high$Group)
+
+```
+
+## Verbal IQ
+
+```{r}
+ggplot(acc_beh, aes(V_IQ, Acc, shape = Group, color = Group)) + geom_point() + theme_bw() + 
+  #facet_grid(info.type ~ train.type) + 
+  geom_smooth(method = "lm", se = FALSE) + xlab("Verbal IQ") + ylab("Accuracy") + guides(color=guide_legend(title="Group"), shape=guide_legend(title="Group"))
+
+viq <- lme(acc.logit ~ P_IQ + WA_SS  + V_IQ + Group * train.type * info.type, random = ~1|Subj, data = acc_beh, method = "ML", na.action = na.omit)
+summary(viq)
+
+viq <- lme(acc.logit ~ V_IQ * Group * train.type * info.type, random = ~1|Subj, data = acc_beh, method = "ML", na.action = na.omit)
+summary(viq)
+
+PC <- subset(acc_beh, Group == "PC")
+TD <- subset(acc_beh, Group == "TD")
+
+cor.test(acc_beh$Acc, acc_beh$V_IQ)
+cor.test(PC$Acc, PC$V_IQ)
+cor.test(TD$Acc, TD$V_IQ)
+```
