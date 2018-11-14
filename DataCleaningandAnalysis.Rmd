@@ -1,8 +1,6 @@
 ---
 title: "CompCat Data Analysis Script"
-output:
-  html_document:
-    toc: true
+output: rmarkdown::github_document
 ---
 
 ```{r setup, include=FALSE}
@@ -312,7 +310,7 @@ p2
 # Misc Analyses
 
 ## Reliability
-```{r}
+```{r, eval = FALSE}
 reliability <- dat3[,c(1,2,3,7)]
 rel <- cast(reliability, Subj ~ condition, sum, value = "Acc")
 alpha(rel[,-1])
